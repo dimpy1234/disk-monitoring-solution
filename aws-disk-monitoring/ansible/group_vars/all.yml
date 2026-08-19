@@ -1,0 +1,128 @@
+---
+# group_vars/all.yml
+# Common variables for disk monitoring deployment
+
+# ============================================================
+# AWS Configuration
+# ============================================================
+
+aws_region: us-east-1
+aws_organization_id: "o-your-org-id"
+
+# Account IDs
+monitoring_account_id: "111111111111"
+management_account_id: "222222222222"
+
+# Cross-account role name (must exist in each workload account)
+cross_account_role_name: MonitoringCrossAccountRole
+
+# ============================================================
+# CloudWatch Agent Configuration
+# ============================================================
+
+# Package URLs (latest stable)
+cw_agent_package_url_rpm: "https://s3.{{ aws_region }}.amazonaws.com/amazoncloudwatch-agent-{{ aws_region }}/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm"
+cw_agent_package_url_deb: "https://s3.{{ aws_region }}.amazonaws.com/amazoncloudwatch-agent-{{ aws_region }}/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+cw_agent_package_url_msi: "https://s3.{{ aws_region }}.amazonaws.com/amazoncloudwatch-agent-{{ aws_region }}/windows/amd64/latest/amazon-cloudwatch-agent.msi"
+
+# Agent paths
+cw_agent_binary_path: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent
+cw_agent_ctl_path: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+cw_agent_config_dir: /opt/aws/amazon-cloudwatch-agent/etc
+cw_agent_config_path: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+cw_agent_config_path_windows: "C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\amazon-cloudwatch-agent.json"
+
+# Metrics collection intervals (seconds)
+cw_agent_collection_interval: 60
+cw_disk_collection_interval: 60
+cw_diskio_collection_interval: 60
+cw_mem_collection_interval: 60
+
+# Metrics namespace
+cw_metrics_namespace: CWAgent
+
+# Default mount points to monitor (overridden by instance tag monitoring:mounts)
+cw_default_mounts:
+  - "/"
+  - "/var"
+  - "/tmp"
+  - "/home"
+  - "/opt"
+
+# Optional log collection (set to true to also ship logs)
+cw_enable_log_collection: false
+cw_log_retention_days: 30
+
+# ============================================================
+# Disk Usage Thresholds
+# ============================================================
+
+# Default thresholds (can be overridden per-tier in group_vars)
+disk_warning_threshold: 80
+disk_critical_threshold: 90
+
+# Tier-specific overrides (used when monitoring_tier tag matches)
+disk_thresholds:
+  critical:
+    warning: 70
+    critical: 85
+  standard:
+    warning: 80
+    critical: 90
+  low:
+    warning: 90
+    critical: 95
+
+# ============================================================
+# SNS Topics for Alerting
+# ============================================================
+
+sns_topic_critical: "arn:aws:sns:{{ aws_region }}:{{ monitoring_account_id }}:disk-alerts-critical"
+sns_topic_warning: "arn:aws:sns:{{ aws_region }}:{{ monitoring_account_id }}:disk-alerts-warning"
+sns_topic_info: "arn:aws:sns:{{ aws_region }}:{{ monitoring_account_id }}:disk-alerts-info"
+
+# ============================================================
+# SSM Configuration
+# ============================================================
+
+# Architecture mapping for SSM Agent package URLs
+ssm_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+
+# ============================================================
+# Deployment Configuration
+# ============================================================
+
+# Batch size for rolling deployments (percent of hosts or absolute number)
+deploy_batch_size: "20%"
+
+# Maximum failure percentage before aborting
+max_fail_percentage: 10
+
+# ============================================================
+# Tagging Configuration
+# ============================================================
+
+# Required tags for monitoring enrollment
+required_tags:
+  - "monitoring:enabled"
+  - "environment"
+
+# Default tags applied to new instances by EventBridge automation
+default_monitoring_tags:
+  "monitoring:enabled": "true"
+  "monitoring:tier": "standard"
+  "monitoring:connection": "ssh"
+
+# ============================================================
+# Connection Settings
+# ============================================================
+
+# SSH settings (for instances not using SSM)
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+ansible_ssh_timeout: 30
+
+# SSM session settings
+ansible_aws_ssm_timeout: 60
+ansible_aws_ssm_retries: 3

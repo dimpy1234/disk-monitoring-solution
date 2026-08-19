@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Baseline resources for disk monitoring in workload accounts.
+  Deploy via StackSets to all workload OUs.
+
+Parameters:
+  MonitoringAccountId:
+    Type: String
+    Description: AWS Account ID of the central monitoring account
+    Default: '111111111111'
+
+  ManagementAccountId:
+    Type: String
+    Description: AWS Account ID of the management account (runs Ansible)
+    Default: '222222222222'
+
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID
+    Default: 'o-your-org-id'
+
+  OAMSinkArn:
+    Type: String
+    Description: ARN of the OAM Sink in the monitoring account
+    Default: 'arn:aws:oam:us-east-1:111111111111:sink/example-sink-id'
+
+Resources:
+  # IAM Role: Cross-account access for Ansible and Monitoring
+  MonitoringCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MonitoringCrossAccountRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${ManagementAccountId}:role/AnsibleControlRole'
+                - !Sub 'arn:aws:iam::${MonitoringAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+      Policies:
+        - PolicyName: SSMRunCommand
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+
+  # IAM Role: EC2 Instance Profile for CloudWatch + SSM
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudWatchAgentRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  CloudWatchAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: CloudWatchAgentProfile
+      Roles:
+        - !Ref CloudWatchAgentRole
+
+  # CloudWatch OAM Link: Connect to monitoring account sink
+  OAMLink:
+    Type: AWS::Oam::Link
+    Properties:
+      LabelTemplate: '$AccountName'
+      ResourceTypes:
+        - 'AWS::CloudWatch::Metric'
+        - 'AWS::Logs::LogGroup'
+      SinkIdentifier: !Ref OAMSinkArn
+
+  # EventBridge Rule: Auto-tag new instances for monitoring
+  NewInstanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: tag-new-instances-for-monitoring
+      Description: Auto-tag new EC2 instances for disk monitoring enrollment
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - RunInstances
+      State: ENABLED
+      Targets:
+        - Id: TagNewInstances
+          Arn: !GetAtt TagInstanceLambda.Arn
+
+  # Lambda: Apply default monitoring tags to new instances
+  TagInstanceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TagInstanceLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TagEC2Instances
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  TagInstanceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tag-new-instances-monitoring
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TagInstanceLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+
+          ec2 = boto3.client('ec2')
+
+          DEFAULT_TAGS = [
+              {'Key': 'monitoring:enabled', 'Value': 'true'},
+              {'Key': 'monitoring:tier', 'Value': 'standard'},
+          ]
+
+          def handler(event, context):
+              detail = event.get('detail', {})
+              response_elements = detail.get('responseElements', {})
+              instances = response_elements.get('instancesSet', {}).get('items', [])
+              instance_ids = [i['instanceId'] for i in instances if 'instanceId' in i]
+
+              if not instance_ids:
+                  return
+
+              described = ec2.describe_instances(InstanceIds=instance_ids)
+              for reservation in described['Reservations']:
+                  for instance in reservation['Instances']:
+                      existing_tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
+                      tags_to_apply = [t for t in DEFAULT_TAGS if t['Key'] not in existing_tags]
+                      if tags_to_apply:
+                          ec2.create_tags(Resources=[instance['InstanceId']], Tags=tags_to_apply)
+                          print(f"Tagged {instance['InstanceId']}")
+
+  TagInstanceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TagInstanceLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NewInstanceRule.Arn
+
+Outputs:
+  CrossAccountRoleArn:
+    Value: !GetAtt MonitoringCrossAccountRole.Arn
+  InstanceProfileArn:
+    Value: !GetAtt CloudWatchAgentInstanceProfile.Arn
+  OAMLinkId:
+    Value: !Ref OAMLink

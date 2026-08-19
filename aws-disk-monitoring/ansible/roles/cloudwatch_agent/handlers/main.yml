@@ -1,0 +1,62 @@
+---
+# roles/cloudwatch_agent/handlers/main.yml
+
+- name: restart cloudwatch agent
+  block:
+    - name: Stop CloudWatch Agent
+      ansible.builtin.command:
+        cmd: >
+          {{ cw_agent_ctl_path }}
+          -a stop
+      changed_when: true
+
+    - name: Start CloudWatch Agent with new config
+      ansible.builtin.command:
+        cmd: >
+          {{ cw_agent_ctl_path }}
+          -a fetch-config
+          -m ec2
+          -s
+          -c file:{{ cw_agent_config_path }}
+      changed_when: true
+
+    - name: Wait for agent to stabilize
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify agent is running after restart
+      ansible.builtin.command:
+        cmd: "{{ cw_agent_ctl_path }} -a status"
+      register: handler_agent_status
+      changed_when: false
+      failed_when: "'running' not in handler_agent_status.stdout"
+      retries: 3
+      delay: 5
+  listen: restart cloudwatch agent
+
+- name: restart cloudwatch agent windows
+  block:
+    - name: Stop CloudWatch Agent service (Windows)
+      ansible.windows.win_service:
+        name: AmazonCloudWatchAgent
+        state: stopped
+
+    - name: Apply new configuration (Windows)
+      ansible.windows.win_command:
+        cmd: >
+          "C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1"
+          -a fetch-config
+          -m ec2
+          -s
+          -c file:{{ cw_agent_config_path_windows }}
+
+    - name: Start CloudWatch Agent service (Windows)
+      ansible.windows.win_service:
+        name: AmazonCloudWatchAgent
+        state: started
+  listen: restart cloudwatch agent windows
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: reload systemd

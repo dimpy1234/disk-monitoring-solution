@@ -1,0 +1,93 @@
+# Ansible AWS EC2 Dynamic Inventory Plugin Configuration
+# Docs: https://docs.ansible.com/ansible/latest/collections/amazon/aws/aws_ec2_inventory.html
+---
+plugin: amazon.aws.aws_ec2
+
+# Assume roles into each workload account for cross-account discovery
+assume_role:
+  role_arn: "{{ lookup('env', 'AWS_ASSUME_ROLE_ARN') | default('') }}"
+
+# Regions to query - add all regions where instances exist
+regions:
+  - us-east-1
+  - us-west-2
+  - eu-west-1
+  - eu-central-1
+
+# Only discover instances tagged for monitoring
+filters:
+  tag:monitoring:enabled:
+    - "true"
+  instance-state-name:
+    - running
+
+# Include these fields in host variables
+hostnames:
+  # Prefer private DNS for connectivity within VPC/VPN
+  - private-dns-name
+  # Fall back to instance ID if DNS not available
+  - instance-id
+
+# Compose variables from EC2 instance metadata
+compose:
+  ansible_host: private_ip_address
+  ansible_user: "'ec2-user' if 'amazon' in (image_id | default('')) else 'ubuntu'"
+  # Use SSM as connection method when ssh is not available
+  ansible_connection: "'aws_ssm' if tags.get('monitoring:connection', 'ssh') == 'ssm' else 'ssh'"
+  ansible_aws_ssm_region: placement.region
+  ansible_aws_ssm_bucket_name: "'ansible-ssm-sessions-' + owner_id"
+  monitoring_tier: "tags.get('monitoring:tier', 'standard')"
+  monitoring_team: "tags.get('monitoring:team', 'platform')"
+  monitoring_mounts: "tags.get('monitoring:mounts', '/').split(',')"
+  instance_account_id: owner_id
+  instance_environment: "tags.get('environment', 'unknown')"
+
+# Group instances by account, environment, OS, region, and tier
+keyed_groups:
+  # Group by AWS account ID
+  - key: owner_id
+    prefix: account
+    separator: "_"
+
+  # Group by environment tag
+  - key: tags.get('environment', 'unknown')
+    prefix: env
+    separator: "_"
+
+  # Group by platform (linux vs windows)
+  - key: platform | default('linux') | lower
+    prefix: os
+    separator: "_"
+
+  # Group by region
+  - key: placement.region
+    prefix: region
+    separator: "_"
+
+  # Group by monitoring tier
+  - key: tags.get('monitoring:tier', 'standard')
+    prefix: tier
+    separator: "_"
+
+  # Group by team ownership
+  - key: tags.get('monitoring:team', 'unassigned')
+    prefix: team
+    separator: "_"
+
+# Groups based on conditionals
+groups:
+  # All monitored instances
+  monitored: "tags.get('monitoring:enabled', 'false') == 'true'"
+  # Instances using SSM connection
+  ssm_managed: "tags.get('monitoring:connection', '') == 'ssm'"
+  # Production instances
+  production: "tags.get('environment', '') == 'production'"
+
+# Cache inventory for 5 minutes to avoid API throttling during large runs
+cache: true
+cache_plugin: jsonfile
+cache_timeout: 300
+cache_connection: /tmp/ansible_aws_ec2_cache
+
+# Use IAM instance profile or environment credentials
+# For cross-account, set AWS_PROFILE or use assume_role above

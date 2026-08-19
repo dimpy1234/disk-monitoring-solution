@@ -1,0 +1,96 @@
+{
+  "agent": {
+    "metrics_collection_interval": {{ cw_agent_collection_interval | default(60) }},
+    "region": "{{ ansible_aws_ssm_region | default(aws_region) | default('us-east-1') }}",
+    "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
+    "debug": false,
+    "run_as_user": "cwagent"
+  },
+  "metrics": {
+    "namespace": "{{ cw_metrics_namespace | default('CWAgent') }}",
+    "metrics_collected": {
+      "disk": {
+        "measurement": [
+          "used_percent",
+          "used",
+          "free",
+{% if ansible_os_family != "Windows" %}
+          "inodes_used",
+          "inodes_free",
+{% endif %}
+          "total"
+        ],
+        "metrics_collection_interval": {{ cw_disk_collection_interval | default(60) }},
+        "resources": [
+{% for mount in monitoring_mounts | default(cw_default_mounts) %}
+          "{{ mount }}"{{ "," if not loop.last else "" }}
+{% endfor %}
+        ],
+{% if ansible_os_family != "Windows" %}
+        "ignore_file_system_types": [
+          "sysfs",
+          "devtmpfs",
+          "tmpfs",
+          "proc",
+          "devpts",
+          "squashfs",
+          "overlay"
+        ],
+{% endif %}
+        "drop_device": false
+      },
+      "diskio": {
+        "measurement": [
+          "io_time",
+          "write_bytes",
+          "read_bytes",
+          "writes",
+          "reads"
+        ],
+        "metrics_collection_interval": {{ cw_diskio_collection_interval | default(60) }},
+        "resources": [
+          "*"
+        ]
+      },
+      "mem": {
+        "measurement": [
+          "mem_used_percent",
+          "mem_available_percent"
+        ],
+        "metrics_collection_interval": {{ cw_mem_collection_interval | default(60) }}
+      }
+    },
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}",
+      "InstanceType": "${aws:InstanceType}",
+      "AutoScalingGroupName": "${aws:AutoScalingGroupName}"
+    },
+    "aggregation_dimensions": [
+      ["InstanceId"],
+      ["InstanceId", "path"],
+      ["InstanceId", "device"]
+    ],
+    "force_flush_interval": 30
+  }{% if cw_enable_log_collection | default(false) %},
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/messages",
+            "log_group_name": "/{{ instance_environment | default('unknown') }}/{{ inventory_hostname }}/messages",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": {{ cw_log_retention_days | default(30) }}
+          },
+          {
+            "file_path": "/var/log/syslog",
+            "log_group_name": "/{{ instance_environment | default('unknown') }}/{{ inventory_hostname }}/syslog",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": {{ cw_log_retention_days | default(30) }}
+          }
+        ]
+      }
+    },
+    "force_flush_interval": 15
+  }{% endif %}
+}

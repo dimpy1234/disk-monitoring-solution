@@ -1,0 +1,181 @@
+---
+# playbooks/deploy_monitoring.yml
+# Main playbook: deploys disk monitoring across all enrolled EC2 instances
+#
+# Usage:
+#   # Deploy to all monitored instances
+#   ansible-playbook playbooks/deploy_monitoring.yml
+#
+#   # Deploy to a specific account
+#   ansible-playbook playbooks/deploy_monitoring.yml --limit account_123456789012
+#
+#   # Deploy to production only
+#   ansible-playbook playbooks/deploy_monitoring.yml --limit env_production
+#
+#   # Deploy to a single host
+#   ansible-playbook playbooks/deploy_monitoring.yml --limit i-0abc123def456
+#
+#   # Dry run (check mode)
+#   ansible-playbook playbooks/deploy_monitoring.yml --check --diff
+#
+#   # Deploy with custom thresholds
+#   ansible-playbook playbooks/deploy_monitoring.yml -e "disk_warning_threshold=75"
+
+- name: Deploy Disk Monitoring Stack
+  hosts: monitored
+  become: true
+  gather_facts: true
+  serial: "{{ deploy_batch_size | default('20%') }}"
+  max_fail_percentage: 10
+
+  pre_tasks:
+    - name: Validate connectivity
+      ansible.builtin.ping:
+      register: ping_result
+      retries: 3
+      delay: 5
+
+    - name: Display target information
+      ansible.builtin.debug:
+        msg: >
+          Deploying to {{ inventory_hostname }}
+          (Account: {{ instance_account_id | default('unknown') }},
+          Tier: {{ monitoring_tier | default('standard') }},
+          Env: {{ instance_environment | default('unknown') }})
+
+    - name: Verify instance has required IAM role
+      ansible.builtin.uri:
+        url: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+        return_content: true
+        timeout: 5
+      register: iam_role_check
+      failed_when: false
+      changed_when: false
+
+    - name: Warn if no IAM role attached
+      ansible.builtin.debug:
+        msg: "WARNING: No IAM instance profile detected. CloudWatch Agent will not be able to publish metrics."
+      when: iam_role_check.status | default(0) != 200
+
+  roles:
+    - role: ssm_setup
+      tags:
+        - ssm
+        - setup
+
+    - role: cloudwatch_agent
+      tags:
+        - cloudwatch
+        - monitoring
+
+  post_tasks:
+    - name: Wait for metrics to appear (first-time deployment)
+      ansible.builtin.pause:
+        seconds: 90
+        prompt: "Waiting for initial metrics to publish to CloudWatch..."
+      when: cw_config_deployed is changed
+      run_once: true
+      tags:
+        - validation
+
+    - name: Validate metrics are being published
+      ansible.builtin.command:
+        cmd: >
+          aws cloudwatch get-metric-statistics
+          --namespace {{ cw_metrics_namespace | default('CWAgent') }}
+          --metric-name disk_used_percent
+          --dimensions Name=InstanceId,Value={{ ansible_ec2_instance_id | default(inventory_hostname) }}
+          --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S)
+          --end-time $(date -u +%Y-%m-%dT%H:%M:%S)
+          --period 60
+          --statistics Average
+          --region {{ aws_region | default('us-east-1') }}
+      register: metric_validation
+      changed_when: false
+      failed_when: false
+      tags:
+        - validation
+        - never
+
+    - name: Record deployment status
+      ansible.builtin.set_fact:
+        deployment_status: "success"
+        deployment_timestamp: "{{ ansible_date_time.iso8601 }}"
+      tags:
+        - always
+
+# --- Post-deployment: Create CloudWatch Alarms ---
+
+- name: Configure CloudWatch Alarms for Disk Monitoring
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags:
+    - alarms
+
+  vars:
+    alarm_targets: "{{ groups['monitored'] | default([]) }}"
+
+  tasks:
+    - name: Create disk usage warning alarm for each instance
+      amazon.aws.cloudwatch_metric_alarm:
+        state: present
+        name: "DiskUsage-{{ hostvars[item].inventory_hostname }}-warning"
+        namespace: "{{ cw_metrics_namespace | default('CWAgent') }}"
+        metric_name: disk_used_percent
+        dimensions:
+          InstanceId: "{{ hostvars[item].ansible_ec2_instance_id | default(item) }}"
+          path: "/"
+        statistic: Average
+        comparison: GreaterThanThreshold
+        threshold: "{{ hostvars[item].disk_warning_threshold | default(disk_warning_threshold) }}"
+        period: 300
+        evaluation_periods: 3
+        datapoints_to_alarm: 2
+        alarm_actions:
+          - "{{ sns_topic_warning }}"
+        ok_actions:
+          - "{{ sns_topic_info }}"
+        alarm_description: "Disk usage warning for {{ hostvars[item].inventory_hostname }} ({{ hostvars[item].monitoring_tier | default('standard') }} tier)"
+        region: "{{ aws_region | default('us-east-1') }}"
+      loop: "{{ alarm_targets }}"
+      loop_control:
+        label: "{{ item }}"
+      when: alarm_targets | length > 0
+
+    - name: Create disk usage critical alarm for each instance
+      amazon.aws.cloudwatch_metric_alarm:
+        state: present
+        name: "DiskUsage-{{ hostvars[item].inventory_hostname }}-critical"
+        namespace: "{{ cw_metrics_namespace | default('CWAgent') }}"
+        metric_name: disk_used_percent
+        dimensions:
+          InstanceId: "{{ hostvars[item].ansible_ec2_instance_id | default(item) }}"
+          path: "/"
+        statistic: Average
+        comparison: GreaterThanThreshold
+        threshold: "{{ hostvars[item].disk_critical_threshold | default(disk_critical_threshold) }}"
+        period: 300
+        evaluation_periods: 3
+        datapoints_to_alarm: 2
+        alarm_actions:
+          - "{{ sns_topic_critical }}"
+        ok_actions:
+          - "{{ sns_topic_info }}"
+        alarm_description: "Disk usage CRITICAL for {{ hostvars[item].inventory_hostname }} ({{ hostvars[item].monitoring_tier | default('standard') }} tier)"
+        treat_missing_data: breaching
+        region: "{{ aws_region | default('us-east-1') }}"
+      loop: "{{ alarm_targets }}"
+      loop_control:
+        label: "{{ item }}"
+      when: alarm_targets | length > 0
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg: |
+          === Deployment Complete ===
+          Instances targeted: {{ alarm_targets | length }}
+          Alarms created: {{ alarm_targets | length * 2 }} (warning + critical per instance)
+          SNS Topics:
+            Warning: {{ sns_topic_warning }}
+            Critical: {{ sns_topic_critical }}

@@ -1,0 +1,142 @@
+---
+# roles/cloudwatch_agent/tasks/main.yml
+# Installs and configures the Amazon CloudWatch Agent for disk monitoring
+
+- name: Gather OS-specific facts
+  ansible.builtin.setup:
+    gather_subset:
+      - distribution
+      - os_family
+
+- name: Include OS-specific variables
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - "{{ ansible_distribution | lower }}.yml"
+    - "{{ ansible_os_family | lower }}.yml"
+    - "default.yml"
+
+# --- Installation ---
+
+- name: Check if CloudWatch Agent is already installed
+  ansible.builtin.stat:
+    path: "{{ cw_agent_binary_path }}"
+  register: cw_agent_installed
+
+- name: Install CloudWatch Agent (Amazon Linux / RHEL / CentOS)
+  ansible.builtin.yum:
+    name: "{{ cw_agent_package_url_rpm }}"
+    state: present
+    disable_gpg_check: false
+  when:
+    - ansible_os_family == "RedHat"
+    - not cw_agent_installed.stat.exists
+  notify: restart cloudwatch agent
+
+- name: Install CloudWatch Agent (Ubuntu / Debian)
+  block:
+    - name: Download CloudWatch Agent deb package
+      ansible.builtin.get_url:
+        url: "{{ cw_agent_package_url_deb }}"
+        dest: /tmp/amazon-cloudwatch-agent.deb
+        mode: "0644"
+        timeout: 60
+
+    - name: Install CloudWatch Agent deb package
+      ansible.builtin.apt:
+        deb: /tmp/amazon-cloudwatch-agent.deb
+        state: present
+
+    - name: Clean up deb package
+      ansible.builtin.file:
+        path: /tmp/amazon-cloudwatch-agent.deb
+        state: absent
+  when:
+    - ansible_os_family == "Debian"
+    - not cw_agent_installed.stat.exists
+  notify: restart cloudwatch agent
+
+- name: Install CloudWatch Agent (Windows)
+  ansible.windows.win_package:
+    path: "{{ cw_agent_package_url_msi }}"
+    state: present
+  when:
+    - ansible_os_family == "Windows"
+    - not cw_agent_installed.stat.exists
+  notify: restart cloudwatch agent windows
+
+# --- Configuration ---
+
+- name: Create CloudWatch Agent configuration directory
+  ansible.builtin.file:
+    path: "{{ cw_agent_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: ansible_os_family != "Windows"
+
+- name: Deploy CloudWatch Agent configuration
+  ansible.builtin.template:
+    src: cloudwatch-agent-config.json.j2
+    dest: "{{ cw_agent_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "{{ cw_agent_ctl_path }} -a verify -c file:%s || true"
+  when: ansible_os_family != "Windows"
+  notify: restart cloudwatch agent
+  register: cw_config_deployed
+
+- name: Deploy CloudWatch Agent configuration (Windows)
+  ansible.windows.win_template:
+    src: cloudwatch-agent-config.json.j2
+    dest: "{{ cw_agent_config_path_windows }}"
+  when: ansible_os_family == "Windows"
+  notify: restart cloudwatch agent windows
+  register: cw_config_deployed_windows
+
+# --- Service Management ---
+
+- name: Start and enable CloudWatch Agent (Linux)
+  ansible.builtin.systemd:
+    name: amazon-cloudwatch-agent
+    state: started
+    enabled: true
+  when: ansible_os_family != "Windows"
+
+- name: Fetch CloudWatch Agent with configuration (Linux)
+  ansible.builtin.command:
+    cmd: >
+      {{ cw_agent_ctl_path }}
+      -a fetch-config
+      -m ec2
+      -s
+      -c file:{{ cw_agent_config_path }}
+  when:
+    - ansible_os_family != "Windows"
+    - cw_config_deployed is changed
+  changed_when: true
+
+- name: Start CloudWatch Agent service (Windows)
+  ansible.windows.win_service:
+    name: AmazonCloudWatchAgent
+    start_mode: auto
+    state: started
+  when: ansible_os_family == "Windows"
+
+# --- Validation ---
+
+- name: Verify CloudWatch Agent is running
+  ansible.builtin.command:
+    cmd: "{{ cw_agent_ctl_path }} -a status"
+  register: cw_agent_status
+  changed_when: false
+  failed_when: "'running' not in cw_agent_status.stdout"
+  when: ansible_os_family != "Windows"
+
+- name: Display agent status
+  ansible.builtin.debug:
+    msg: "CloudWatch Agent status: {{ cw_agent_status.stdout_lines | default(['unknown']) }}"
+  when:
+    - ansible_os_family != "Windows"
+    - cw_agent_status is defined

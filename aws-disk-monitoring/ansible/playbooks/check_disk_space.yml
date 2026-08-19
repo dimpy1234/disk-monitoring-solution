@@ -1,0 +1,144 @@
+---
+# playbooks/check_disk_space.yml
+# Ad-hoc playbook for immediate disk space checks across the fleet
+#
+# Usage:
+#   # Check all monitored instances
+#   ansible-playbook playbooks/check_disk_space.yml
+#
+#   # Check specific hosts
+#   ansible-playbook playbooks/check_disk_space.yml --limit i-0abc123,i-0def456
+#
+#   # Check only production
+#   ansible-playbook playbooks/check_disk_space.yml --limit env_production
+#
+#   # Check with custom threshold (flag hosts above 70%)
+#   ansible-playbook playbooks/check_disk_space.yml -e "check_threshold=70"
+#
+#   # Output as JSON for pipeline consumption
+#   ansible-playbook playbooks/check_disk_space.yml -e "output_format=json"
+
+- name: Disk Space Health Check
+  hosts: "{{ target_hosts | default('monitored') }}"
+  become: true
+  gather_facts: false
+  strategy: free
+
+  vars:
+    check_threshold: "{{ disk_warning_threshold | default(80) }}"
+    output_format: "table"
+
+  tasks:
+    # --- Linux Disk Check ---
+    - name: Get disk usage (Linux)
+      ansible.builtin.shell:
+        cmd: |
+          df -Ph --exclude-type=tmpfs --exclude-type=devtmpfs --exclude-type=squashfs --exclude-type=overlay |
+          tail -n +2 |
+          awk '{print $1"|"$2"|"$3"|"$4"|"$5"|"$6}'
+      register: disk_usage_linux
+      changed_when: false
+      when: ansible_os_family | default('') != "Windows"
+
+    - name: Get inode usage (Linux)
+      ansible.builtin.shell:
+        cmd: |
+          df -Pi --exclude-type=tmpfs --exclude-type=devtmpfs |
+          tail -n +2 |
+          awk '{print $6"|"$5}'
+      register: inode_usage_linux
+      changed_when: false
+      when: ansible_os_family | default('') != "Windows"
+
+    # --- Windows Disk Check ---
+    - name: Get disk usage (Windows)
+      ansible.windows.win_shell: |
+        Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3" |
+        Select-Object DeviceID,
+          @{N='Size_GB';E={[math]::Round($_.Size/1GB,2)}},
+          @{N='Free_GB';E={[math]::Round($_.FreeSpace/1GB,2)}},
+          @{N='Used_Percent';E={[math]::Round(($_.Size-$_.FreeSpace)/$_.Size*100,1)}} |
+        ConvertTo-Json
+      register: disk_usage_windows
+      changed_when: false
+      when: ansible_os_family | default('') == "Windows"
+
+    # --- Analysis ---
+    - name: Parse disk usage and identify issues (Linux)
+      ansible.builtin.set_fact:
+        disk_report: >-
+          {{
+            disk_usage_linux.stdout_lines | default([]) | map('split', '|') |
+            map('zip', ['device', 'size', 'used', 'avail', 'percent', 'mount']) |
+            map('map', 'reverse') | map('list') | map('items2dict') |
+            list
+          }}
+      when: disk_usage_linux is defined and disk_usage_linux.stdout_lines is defined
+
+    - name: Identify filesystems above threshold (Linux)
+      ansible.builtin.set_fact:
+        critical_mounts: >-
+          {{
+            disk_usage_linux.stdout_lines | default([]) |
+            select('search', '[89][0-9]%|100%') |
+            list
+          }}
+        warning_mounts: >-
+          {{
+            disk_usage_linux.stdout_lines | default([]) |
+            select('search', '[7-8][0-9]%') |
+            list
+          }}
+      when: disk_usage_linux is defined
+
+    # --- Reporting ---
+    - name: Display disk usage report
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  DISK USAGE REPORT: {{ inventory_hostname | center(36) }}  ║
+          ╠══════════════════════════════════════════════════════════════╣
+          {% if disk_usage_linux is defined and disk_usage_linux.stdout is defined %}
+          {% for line in disk_usage_linux.stdout_lines | default([]) %}
+          ║  {{ line | replace('|', ' | ') | truncate(56) }}  ║
+          {% endfor %}
+          {% endif %}
+          ╠══════════════════════════════════════════════════════════════╣
+          {% if critical_mounts | default([]) | length > 0 %}
+          ║  ⚠️  CRITICAL (>90%): {{ critical_mounts | length }} mount(s)      ║
+          {% endif %}
+          {% if warning_mounts | default([]) | length > 0 %}
+          ║  ⚡ WARNING (>{{ check_threshold }}%): {{ warning_mounts | length }} mount(s)       ║
+          {% endif %}
+          {% if critical_mounts | default([]) | length == 0 and warning_mounts | default([]) | length == 0 %}
+          ║  ✓  All filesystems within acceptable limits              ║
+          {% endif %}
+          ╚══════════════════════════════════════════════════════════════╝
+
+    - name: Flag hosts with critical disk usage
+      ansible.builtin.fail:
+        msg: "CRITICAL: Disk usage above 90% on {{ critical_mounts | join(', ') }}"
+      when:
+        - critical_mounts | default([]) | length > 0
+        - fail_on_critical | default(false) | bool
+      ignore_errors: "{{ ignore_critical_errors | default(true) }}"
+
+    # --- Summary Play ---
+- name: Fleet Disk Usage Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Compile fleet summary
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════
+          FLEET DISK USAGE SUMMARY
+          ════════════════════════════════════════
+          Total hosts checked: {{ ansible_play_hosts_all | default([]) | length }}
+          Check threshold: {{ check_threshold | default(80) }}%
+
+          Review individual host reports above for details.
+          Run with -e "fail_on_critical=true" to fail on critical usage.
+          ════════════════════════════════════════

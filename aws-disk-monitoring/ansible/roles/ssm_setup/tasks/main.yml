@@ -1,0 +1,175 @@
+---
+# roles/ssm_setup/tasks/main.yml
+# Ensures AWS Systems Manager Agent is installed, configured, and running
+
+- name: Gather OS facts
+  ansible.builtin.setup:
+    gather_subset:
+      - distribution
+      - os_family
+      - architecture
+
+# --- Check current SSM Agent status ---
+
+- name: Check if SSM Agent is installed (Linux)
+  ansible.builtin.stat:
+    path: /usr/bin/amazon-ssm-agent
+  register: ssm_agent_binary
+  when: ansible_os_family != "Windows"
+
+- name: Check SSM Agent service status (Linux)
+  ansible.builtin.systemd:
+    name: amazon-ssm-agent
+  register: ssm_agent_service
+  ignore_errors: true
+  when: ansible_os_family != "Windows"
+
+# --- Installation ---
+
+- name: Install SSM Agent (Amazon Linux / RHEL / CentOS)
+  ansible.builtin.yum:
+    name: "https://s3.{{ aws_region | default('us-east-1') }}.amazonaws.com/amazon-ssm-{{ aws_region | default('us-east-1') }}/latest/linux_{{ ssm_arch_map[ansible_architecture] | default('amd64') }}/amazon-ssm-agent.rpm"
+    state: present
+    disable_gpg_check: false
+  when:
+    - ansible_os_family == "RedHat"
+    - not ssm_agent_binary.stat.exists | default(false)
+  notify: restart ssm agent
+
+- name: Install SSM Agent (Ubuntu / Debian)
+  block:
+    - name: Install snapd (required for SSM on Ubuntu 20.04+)
+      ansible.builtin.apt:
+        name: snapd
+        state: present
+      when: ansible_distribution_major_version | int >= 20
+
+    - name: Install SSM Agent via snap (Ubuntu 20.04+)
+      community.general.snap:
+        name: amazon-ssm-agent
+        classic: true
+        state: present
+      when: ansible_distribution_major_version | int >= 20
+
+    - name: Install SSM Agent via deb (older Ubuntu/Debian)
+      block:
+        - name: Download SSM Agent deb package
+          ansible.builtin.get_url:
+            url: "https://s3.{{ aws_region | default('us-east-1') }}.amazonaws.com/amazon-ssm-{{ aws_region | default('us-east-1') }}/latest/debian_{{ ssm_arch_map[ansible_architecture] | default('amd64') }}/amazon-ssm-agent.deb"
+            dest: /tmp/amazon-ssm-agent.deb
+            mode: "0644"
+            timeout: 60
+
+        - name: Install SSM Agent deb package
+          ansible.builtin.apt:
+            deb: /tmp/amazon-ssm-agent.deb
+            state: present
+
+        - name: Clean up deb package
+          ansible.builtin.file:
+            path: /tmp/amazon-ssm-agent.deb
+            state: absent
+      when: ansible_distribution_major_version | int < 20
+  when:
+    - ansible_os_family == "Debian"
+    - not ssm_agent_binary.stat.exists | default(false)
+  notify: restart ssm agent
+
+# --- Configuration ---
+
+- name: Ensure SSM Agent configuration directory exists
+  ansible.builtin.file:
+    path: /etc/amazon/ssm
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: ansible_os_family != "Windows"
+
+- name: Deploy SSM Agent configuration (custom settings)
+  ansible.builtin.copy:
+    content: |
+      {
+        "Profile": {
+          "ShareCreds": false,
+          "ShareProfile": ""
+        },
+        "Mgs": {
+          "Region": "{{ aws_region | default('us-east-1') }}",
+          "Endpoint": "",
+          "StopTimeoutMillis": 20000,
+          "SessionWorkersLimit": 1000
+        },
+        "Agent": {
+          "Region": "{{ aws_region | default('us-east-1') }}",
+          "Endpoint": "",
+          "ContainerMode": false
+        },
+        "Ssm": {
+          "Endpoint": ""
+        }
+      }
+    dest: /etc/amazon/ssm/amazon-ssm-agent.json
+    owner: root
+    group: root
+    mode: "0644"
+  when: ansible_os_family != "Windows"
+  notify: restart ssm agent
+
+# --- Service Management ---
+
+- name: Enable and start SSM Agent (systemd)
+  ansible.builtin.systemd:
+    name: amazon-ssm-agent
+    state: started
+    enabled: true
+  when:
+    - ansible_os_family != "Windows"
+    - ansible_service_mgr == "systemd"
+
+- name: Enable and start SSM Agent (snap-based)
+  ansible.builtin.command:
+    cmd: snap start amazon-ssm-agent
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_os_family == "Debian"
+    - ansible_distribution_major_version | int >= 20
+
+# --- Validation ---
+
+- name: Wait for SSM Agent to register
+  ansible.builtin.pause:
+    seconds: 10
+  when: ssm_agent_binary.stat is defined and not ssm_agent_binary.stat.exists
+
+- name: Verify SSM Agent is running
+  ansible.builtin.command:
+    cmd: systemctl is-active amazon-ssm-agent
+  register: ssm_status
+  changed_when: false
+  failed_when: ssm_status.rc != 0
+  when:
+    - ansible_os_family != "Windows"
+    - ansible_service_mgr == "systemd"
+
+- name: Check SSM Agent connectivity
+  ansible.builtin.command:
+    cmd: amazon-ssm-agent -version
+  register: ssm_version
+  changed_when: false
+  when: ansible_os_family != "Windows"
+
+- name: Display SSM Agent version
+  ansible.builtin.debug:
+    msg: "SSM Agent version: {{ ssm_version.stdout | default('unknown') }}"
+  when: ssm_version is defined
+
+# --- Handlers ---
+
+handlers:
+  - name: restart ssm agent
+    ansible.builtin.systemd:
+      name: amazon-ssm-agent
+      state: restarted
+    when: ansible_service_mgr == "systemd"
